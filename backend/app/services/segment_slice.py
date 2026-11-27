@@ -2,6 +2,9 @@
 
 数据链路位置：下钻分析层，消费显著性检验与归因分析的差异结果，按维度切片
 计算分组差异，输出给报告生成器形成下钻章节。
+
+归档恢复的切片以 SQLite 迁移库为准（单一事实来源）；本服务在列表/明细查询时
+合并恢复后的切片，使其在原"切片分析器"页面可见，且能核对原归档号与样本版次。
 """
 from __future__ import annotations
 
@@ -10,6 +13,36 @@ from typing import Any
 
 from app.services.base import BaseModuleService
 from app.store import store
+
+
+def _recovered_slice_rows() -> list[dict[str, Any]]:
+    """从迁移库读取已恢复切片，转成切片分析器列表行（不回写内存，避免双写）。"""
+    try:
+        from app.archive.repository import ArchiveRepository
+    except Exception:
+        return []
+    repo = ArchiveRepository()
+    rows: list[dict[str, Any]] = []
+    for record in repo.list_slice_recoveries():
+        evidence = record.get("evidence_json")
+        rows.append({
+            "id": 10_000 + record["id"],
+            "切片批次": record["slice_batch"],
+            "实验编码": record.get("exp_code", ""),
+            "切片维度": "归档恢复",
+            "切片值": f"原归档号 {record['archive_no']} / 样本版次 {record['sample_version']}",
+            "分组差异": str(record.get("metric_value", "")),
+            "status": "已计算" if record.get("recover_status") == "已恢复" else record.get("recover_status", ""),
+            "pending": False,
+            "abnormal": False,
+            "原归档号": record["archive_no"],
+            "归档版次": record["version"],
+            "归档存储版本": record["storage_version"],
+            "样本版次": record["sample_version"],
+            "实际数据源": record["data_source"],
+            "恢复证据": evidence,
+        })
+    return rows
 
 
 class SegmentSliceService(BaseModuleService):
@@ -21,6 +54,42 @@ class SegmentSliceService(BaseModuleService):
     STATUS_ORDER = ["待计算", "已计算", "计算失败"]
     ACTION_RULES = {"开始计算": "已计算", "重试计算": "计算失败"}
     NEGATIVE_ACTIONS = []
+
+    def list_entries(
+        self,
+        *,
+        filters: dict[str, str] | None = None,
+        keyword: str | None = None,
+        status: str | None = None,
+        page: int = 1,
+        size: int = 20,
+    ) -> tuple[list[dict[str, Any]], int]:
+        # 合并迁移库中恢复的切片，再套用通用筛选/分页。
+        merged = list(store.rows(self.MODULE)) + _recovered_slice_rows()
+        for field, expected in (filters or {}).items():
+            if field in self.LIST_FIELDS:
+                merged = [
+                    row for row in merged
+                    if expected.casefold() in str(row.get(field, "")).casefold()
+                ]
+        if keyword and self.LIST_FIELDS:
+            field = self.LIST_FIELDS[0]
+            merged = [row for row in merged if keyword.casefold() in str(row.get(field, "")).casefold()]
+        if status:
+            merged = [row for row in merged if row.get("status") == status]
+        total = len(merged)
+        start = (page - 1) * size
+        return merged[start:start + size], total
+
+    def get_entry(self, entry_id: int) -> dict[str, Any] | None:
+        local = super().get_entry(entry_id)
+        if local is not None:
+            return local
+        for row in _recovered_slice_rows():
+            if int(row.get("id", 0)) == entry_id:
+                return row
+        return None
+
 
     # ---- 业务扩展：维度切片与差异计算 ----
 

@@ -79,5 +79,43 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 实验归档迁移与恢复（SQLite 持久化）
+
+把实验归档库的进程内归档整包迁移到 SQLite，支撑上线切换/回滚/重启后的可续办与可审计。
+
+- 后端代码：`backend/app/archive/`
+  - `db.py` / `engine.py`：SQLite 建表（WAL）、连接与写锁、轻量列迁移。
+  - `repository.py`：集中所有 SQL；`migration.py` 按原归档号整包迁移（摘要/指标/恢复依据三段）。
+  - `credential.py`：HMAC 迁移恢复凭证（绑定原归档号，可离线核验）。
+  - `restore.py`：原编号受理、幂等续办、v2 优先取数（兼容旧库回退）、切片只成功一次。
+  - `deployment.py`：上线/回滚流水与启动时未办结恢复续办。
+  - `scenario.py`：A17 演练现场（摘要已写未确认、未办结恢复、一次回滚）。
+- 接口前缀：`/api/archive-migration`（进度、整包迁移、恢复受理/续办、切片证据、部署流水）。
+- 前端页面：导航「归档迁移与恢复」→ `/archive-migration`（`ArchiveMigrationView.vue`）。
+- 切片分析器 `segment_slice` 列表会合并迁移库中已恢复切片，可在原页面核对原归档号与样本版次。
+
+关键约束的落地点：
+
+- 同一实验编码的不同归档版次以 `(archive_no, version)` 唯一存放，绝不合并。
+- 摘要、指标、已登记恢复依据作为完整一份数据迁移；缺失源字段登记到 `missingFields` 可查。
+- 整包源快照随迁移落库，全新进程仅凭 SQLite 即可续办，不依赖进程内存旧库。
+- 已办结恢复重复触发直接返回原结果（幂等命中），不产生第二条切片；未办结请求保留阶段现场可续。
+- 切片按归档存储版本 v2 及兼容数据取实际计算输入，明细含原归档号、样本版次、证据指纹与原摘要。
+
+环境变量：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ARCHIVE_DB_PATH` | `backend/data/archive.sqlite3` | 迁移库 SQLite 文件路径（部署指向持久卷） |
+| `ARCHIVE_CREDENTIAL_SECRET` | 开发占位密钥 | 凭证 HMAC 密钥，生产必须注入 |
+| `ARCHIVE_AUTO_RECOVERY` | `1` | 启动时是否自动续办未办结恢复（测试可置 `0`） |
+
+测试（仅依赖标准库与现有 venv）：
+
+```bash
+cd backend
+ARCHIVE_AUTO_RECOVERY=0 .venv/bin/python -m unittest discover -s app.tests -v
+```
+
 领域：数据工程
 子方向：数据分析与数据应用
